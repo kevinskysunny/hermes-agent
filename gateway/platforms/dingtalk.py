@@ -31,9 +31,11 @@ import json
 import logging
 import os
 import re
+import tempfile
 import traceback
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 try:
@@ -1201,14 +1203,17 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     async def _fetch_download_url(
         self, code: str, robot_code: str, token: str, obj, key: str
-    ) -> None:
-        """Fetch download URL for a single code using the robot SDK."""
+    ) -> Optional[str]:
+        """Fetch download URL for a single code using the robot SDK.
+        
+        Returns the download URL on success, None on failure.
+        """
         if not self._robot_sdk:
             logger.warning(
                 "[%s] Robot SDK not initialized, cannot resolve media code",
                 self.name,
             )
-            return
+            return None
         try:
             request = dingtalk_robot_models.RobotMessageFileDownloadRequest(
                 download_code=code,
@@ -1225,18 +1230,86 @@ class DingTalkAdapter(BasePlatformAdapter):
             if body:
                 url = getattr(body, "download_url", None)
                 if url:
+                    # Store URL back into the object so callers can read it
                     if hasattr(obj, key):
                         setattr(obj, key, url)
                     elif isinstance(obj, dict):
                         obj[key] = url
-            else:
-                logger.warning(
-                    "[%s] Failed to download media: empty response for code %s",
-                    self.name,
-                    code,
-                )
+                    return url
+            logger.warning(
+                "[%s] Failed to download media: empty response for code %s",
+                self.name,
+                code,
+            )
         except Exception as e:
             logger.error("[%s] Error resolving media code %s: %s", self.name, code, e)
+        return None
+
+    async def _download_media_file(
+        self, download_url: str, token: str, file_extension: str = ""
+    ) -> Optional[str]:
+        """Download a DingTalk media file to a local temp path.
+
+        Args:
+            download_url: The CDN URL returned by the DingTalk file download API.
+            token: The current DingTalk access token (used as Bearer auth).
+            file_extension: Optional file extension hint (e.g. '.pdf', '.mp4').
+
+        Returns:
+            Local file path on success, None on failure.
+        """
+        if not HTTPX_AVAILABLE or not self._http_client:
+            logger.warning("[%s] httpx not available, cannot download media file", self.name)
+            return None
+
+        try:
+            # Determine a sensible file extension if not provided
+            ext = file_extension or self._guess_extension_from_url(download_url)
+            # Create a temp file that will persist (not auto-deleted)
+            suffix = ext
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                local_path = tmp.name
+
+            headers = {
+                "Authorization": f"Bearer {token}",
+            }
+            response = await self._http_client.get(download_url, headers=headers, timeout=30.0)
+            response.raise_for_status()
+
+            with open(local_path, "wb") as f:
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    f.write(chunk)
+
+            logger.info("[%s] Downloaded media to: %s", self.name, local_path)
+            return local_path
+        except Exception as e:
+            logger.error("[%s] Failed to download media from %s: %s", self.name, download_url, e)
+            return None
+
+    @staticmethod
+    def _guess_extension_from_url(url: str) -> str:
+        """Guess file extension from URL path."""
+        path = url.split("?")[0]
+        _, ext = os.path.splitext(path)
+        # Normalize common extensions
+        ext_map = {
+            ".jpg": ".jpg",
+            ".jpeg": ".jpg",
+            ".png": ".png",
+            ".gif": ".gif",
+            ".mp4": ".mp4",
+            ".mp3": ".mp3",
+            ".wav": ".wav",
+            ".pdf": ".pdf",
+            ".doc": ".doc",
+            ".docx": ".docx",
+            ".xls": ".xls",
+            ".xlsx": ".xlsx",
+            ".ppt": ".ppt",
+            ".pptx": ".pptx",
+            ".txt": ".txt",
+        }
+        return ext_map.get(ext.lower(), ".bin")
 
     @staticmethod
     def _normalize_markdown(text: str) -> str:
