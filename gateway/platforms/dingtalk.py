@@ -32,6 +32,7 @@ import logging
 import mimetypes
 import os
 import re
+import struct
 import tempfile
 import traceback
 import uuid
@@ -908,6 +909,41 @@ class DingTalkAdapter(BasePlatformAdapter):
         """DingTalk does not support typing indicators."""
         pass
 
+    @staticmethod
+    def _get_video_duration_ms(video_path: str) -> Optional[int]:
+        """Parse video duration from MP4 moov/mvhd atom.
+
+        Returns duration in milliseconds, or None if it cannot be determined.
+        Does not require external libraries — reads the MP4 container directly.
+        """
+        try:
+            with open(video_path, "rb") as f:
+                data = f.read()
+            # Find moov atom
+            moov_pos = data.find(b"moov")
+            if moov_pos == -1:
+                return None
+            moov_data = data[moov_pos:]
+            # Find mvhd inside moov
+            mvhd_pos = moov_data.find(b"mvhd")
+            if mvhd_pos == -1:
+                return None
+            mvhd_payload = moov_data[mvhd_pos + 4:]  # skip size(4) + 'mvhd'(4)
+            version = mvhd_payload[0]
+            if version == 0:
+                # 32-bit: timescale at offset 12, duration at offset 16
+                timescale = struct.unpack(">I", mvhd_payload[12:16])[0]
+                duration = struct.unpack(">I", mvhd_payload[16:20])[0]
+            else:
+                # 64-bit: timescale at offset 16, duration at offset 24
+                timescale = struct.unpack(">Q", mvhd_payload[16:24])[0]
+                duration = struct.unpack(">Q", mvhd_payload[24:32])[0]
+            if timescale == 0:
+                return None
+            return int(duration / timescale * 1000)
+        except Exception:
+            return None
+
     async def _upload_media(
         self, file_path: str, file_type: str = "file"
     ) -> Optional[str]:
@@ -959,8 +995,13 @@ class DingTalkAdapter(BasePlatformAdapter):
         media_id: str,
         file_name: str,
         msg_type: str = "file",
+        video_duration_ms: Optional[int] = None,
     ) -> SendResult:
-        """Send a file/media message via session webhook."""
+        """Send a file/media message via session webhook.
+
+        Args:
+            video_duration_ms: Required for video messages. Duration in milliseconds.
+        """
         payload = {
             "msgtype": msg_type,
             msg_type: {"media_id": media_id},
@@ -968,7 +1009,10 @@ class DingTalkAdapter(BasePlatformAdapter):
         if msg_type == "file":
             payload["file"] = {"media_id": media_id, "file_name": file_name}
         elif msg_type == "video":
-            payload["video"] = {"media_id": media_id}
+            video_data: Dict[str, Any] = {"media_id": media_id}
+            if video_duration_ms is not None:
+                video_data["duration"] = video_duration_ms // 1000  # DingTalk expects seconds
+            payload["video"] = video_data
 
         try:
             resp = await self._http_client.post(
@@ -994,7 +1038,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         file_path: str,
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
-        reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
@@ -1020,6 +1063,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         )
 
         # If caption is provided, send it as a follow-up text message
+        caption_failed = None
         if caption and result.success:
             text_payload = {
                 "msgtype": "text",
@@ -1030,7 +1074,10 @@ class DingTalkAdapter(BasePlatformAdapter):
                     session_webhook, json=text_payload, timeout=15.0
                 )
             except Exception as e:
+                caption_failed = str(e)
                 logger.warning("[%s] Caption send failed: %s", self.name, e)
+        if caption_failed and result.success:
+            result.error = f"[caption_failed] {caption_failed}"
         return result
 
     async def send_image_file(
@@ -1038,7 +1085,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         chat_id: str,
         image_path: str,
         caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
@@ -1062,6 +1108,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             "msgtype": "image",
             "image": {"media_id": media_id},
         }
+        result: SendResult
         try:
             resp = await self._http_client.post(
                 session_webhook, json=payload, timeout=30.0
@@ -1082,6 +1129,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
         # If caption is provided, send it as a follow-up text message
+        caption_failed = None
         if caption and result.success:
             text_payload = {
                 "msgtype": "text",
@@ -1092,7 +1140,10 @@ class DingTalkAdapter(BasePlatformAdapter):
                     session_webhook, json=text_payload, timeout=15.0
                 )
             except Exception as e:
+                caption_failed = str(e)
                 logger.warning("[%s] Caption send failed: %s", self.name, e)
+        if caption_failed and result.success:
+            result.error = f"[caption_failed] {caption_failed}"
         return result
 
     async def send_video(
@@ -1100,7 +1151,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         chat_id: str,
         video_path: str,
         caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
@@ -1120,11 +1170,21 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not media_id:
             return SendResult(success=False, error="Video upload to DingTalk failed")
 
+        # Get video duration (before upload so we can fail fast if missing)
+        duration_ms = self._get_video_duration_ms(video_path)
+        if duration_ms is None:
+            logger.warning("[%s] Could not determine video duration for %s", self.name, video_path)
+
         result = await self._send_file_message(
-            session_webhook, media_id, os.path.basename(video_path), msg_type="video"
+            session_webhook,
+            media_id,
+            os.path.basename(video_path),
+            msg_type="video",
+            video_duration_ms=duration_ms,
         )
 
         # If caption is provided, send it as a follow-up text message
+        caption_failed = None
         if caption and result.success:
             text_payload = {
                 "msgtype": "text",
@@ -1135,7 +1195,10 @@ class DingTalkAdapter(BasePlatformAdapter):
                     session_webhook, json=text_payload, timeout=15.0
                 )
             except Exception as e:
+                caption_failed = str(e)
                 logger.warning("[%s] Caption send failed: %s", self.name, e)
+        if caption_failed and result.success:
+            result.error = f"[caption_failed] {caption_failed}"
         return result
 
     async def send_voice(
@@ -1143,7 +1206,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         chat_id: str,
         audio_path: str,
         caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
@@ -1191,6 +1253,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
         # If caption is provided, send it as a follow-up text message
+        caption_failed = None
         if caption and result.success:
             text_payload = {
                 "msgtype": "text",
@@ -1201,7 +1264,10 @@ class DingTalkAdapter(BasePlatformAdapter):
                     session_webhook, json=text_payload, timeout=15.0
                 )
             except Exception as e:
+                caption_failed = str(e)
                 logger.warning("[%s] Caption send failed: %s", self.name, e)
+        if caption_failed and result.success:
+            result.error = f"[caption_failed] {caption_failed}"
         return result
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
