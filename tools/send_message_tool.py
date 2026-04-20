@@ -144,6 +144,36 @@ def _handle_list():
         return json.dumps(_error(f"Failed to load channel directory: {e}"))
 
 
+def _build_send_metadata(platform_name: str, chat_id: str):
+    """Build transport-specific metadata for send helpers.
+
+    For DingTalk, media sends must use the active conversation's
+    ``session_webhook``.  When a send_message() call targets the current
+    DingTalk chat, pull the webhook from session contextvars so the helper can
+    reply with files/images/documents in-band.
+    """
+    if platform_name != "dingtalk" or not chat_id:
+        return None
+
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return None
+
+    current_platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+    current_chat_id = (get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
+    session_webhook = (get_session_env("HERMES_SESSION_DINGTALK_WEBHOOK", "") or "").strip()
+
+    if current_platform != "dingtalk" or current_chat_id != str(chat_id).strip() or not session_webhook:
+        return None
+
+    metadata = {"session_webhook": session_webhook}
+    expires_at = (get_session_env("HERMES_SESSION_DINGTALK_WEBHOOK_EXPIRES_AT", "") or "").strip()
+    if expires_at:
+        metadata["session_webhook_expired_time"] = expires_at
+    return metadata
+
+
 def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
@@ -268,14 +298,20 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
+        send_metadata = _build_send_metadata(platform_name, chat_id)
+        send_kwargs = {
+            "thread_id": thread_id,
+            "media_files": media_files,
+        }
+        if send_metadata:
+            send_kwargs["metadata"] = send_metadata
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
                 cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
+                **send_kwargs,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -389,7 +425,7 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, metadata=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -432,6 +468,13 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     }
     if _feishu_available:
         _MAX_LENGTHS[Platform.FEISHU] = FeishuAdapter.MAX_MESSAGE_LENGTH
+    # DingTalk stream adapter
+    try:
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        _MAX_LENGTHS[Platform.DINGTALK] = DingTalkAdapter.MAX_MESSAGE_LENGTH
+        _dingtalk_available = True
+    except ImportError:
+        _dingtalk_available = False
 
     # Smart-chunk the message to fit within platform limits.
     # For short messages or platforms without a known limit this is a no-op.
@@ -500,11 +543,28 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- DingTalk: use the native adapter helper when media is present ---
+    if platform == Platform.DINGTALK and _dingtalk_available and (media_files or metadata):
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_dingtalk_via_adapter(
+                pconfig,
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else [],
+                metadata=metadata,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-Telegram/Discord platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, and weixin; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, dingtalk, and weixin; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -512,7 +572,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, and weixin"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, dingtalk, and weixin"
         )
 
     last_result = None
@@ -1260,6 +1320,70 @@ async def _send_dingtalk(extra, chat_id, message):
             if data.get("errcode", 0) != 0:
                 return _error(f"DingTalk API error: {data.get('errmsg', 'unknown')}")
         return {"success": True, "platform": "dingtalk", "chat_id": chat_id}
+    except Exception as e:
+        return _error(f"DingTalk send failed: {e}")
+
+
+async def _send_dingtalk_via_adapter(pconfig, chat_id, message, media_files=None, metadata=None):
+    """Send via the DingTalk stream adapter so native media uploads are preserved.
+
+    This function connects to DingTalk Stream Mode, sends text/media,
+    and immediately disconnects — it is a one-shot helper for send_message.
+    DingTalk media requires a session_webhook from an incoming message,
+    so this only works when there is a recent active conversation context.
+    """
+    try:
+        from gateway.platforms.dingtalk import DingTalkAdapter
+    except ImportError:
+        return _error("DingTalk stream adapter not available.")
+
+    media_files = media_files or []
+    metadata = metadata or {}
+
+    try:
+        adapter = DingTalkAdapter(pconfig)
+        connected = await adapter.connect()
+        if not connected:
+            return _error("DingTalk stream connect failed")
+
+        try:
+            last_result = None
+
+            if message.strip():
+                last_result = await adapter.send(chat_id, message, metadata=metadata or None)
+                if not last_result.success:
+                    return _error(f"DingTalk send failed: {last_result.error}")
+
+            for media_path, is_voice in media_files:
+                if not os.path.exists(media_path):
+                    return _error(f"Media file not found: {media_path}")
+
+                ext = os.path.splitext(media_path)[1].lower()
+                if ext in _IMAGE_EXTS:
+                    last_result = await adapter.send_image_file(chat_id, media_path, metadata=metadata or None)
+                elif ext in _VIDEO_EXTS:
+                    last_result = await adapter.send_video(chat_id, media_path, metadata=metadata or None)
+                elif ext in _VOICE_EXTS and is_voice:
+                    last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata or None)
+                elif ext in _AUDIO_EXTS:
+                    last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata or None)
+                else:
+                    last_result = await adapter.send_document(chat_id, media_path, metadata=metadata or None)
+
+                if not last_result.success:
+                    return _error(f"DingTalk media send failed: {last_result.error}")
+
+            if last_result is None:
+                return _error("No deliverable text or media remained after processing MEDIA tags")
+
+            return {
+                "success": True,
+                "platform": "dingtalk",
+                "chat_id": chat_id,
+                "message_id": last_result.message_id,
+            }
+        finally:
+            await adapter.disconnect()
     except Exception as e:
         return _error(f"DingTalk send failed: {e}")
 
