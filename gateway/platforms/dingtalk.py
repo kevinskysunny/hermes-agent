@@ -935,8 +935,9 @@ class DingTalkAdapter(BasePlatformAdapter):
                 timescale = struct.unpack(">I", mvhd_payload[12:16])[0]
                 duration = struct.unpack(">I", mvhd_payload[16:20])[0]
             else:
-                # 64-bit: timescale at offset 16, duration at offset 24
-                timescale = struct.unpack(">Q", mvhd_payload[16:24])[0]
+                # 64-bit: timescale at offset 20, duration at offset 24
+                # (creation_time and modification_time are 8 bytes each in v1)
+                timescale = struct.unpack(">I", mvhd_payload[20:24])[0]
                 duration = struct.unpack(">Q", mvhd_payload[24:32])[0]
             if timescale == 0:
                 return None
