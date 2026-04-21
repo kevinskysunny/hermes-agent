@@ -1469,6 +1469,9 @@ class DingTalkAdapter(BasePlatformAdapter):
         finalize: bool = False,
     ) -> None:
         """Stream content to an existing AI Card."""
+        if not self._card_sdk:
+            logger.warning("[%s] Card SDK not initialized, skipping stream update", self.name)
+            return
         stream_request = dingtalk_card_models.StreamingUpdateRequest(
             out_track_id=out_track_id,
             guid=str(uuid.uuid4()),
