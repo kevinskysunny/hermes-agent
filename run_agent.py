@@ -970,6 +970,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        background_review_enabled: bool = True,
     ):
         """
         Initialize the AI Agent.
@@ -1015,6 +1016,8 @@ class AIAgent:
             load_soul_identity (bool): If True, still use ~/.hermes/SOUL.md as the primary
                 identity even when skip_context_files=True. Project context files from the cwd
                 remain skipped.
+            background_review_enabled (bool): Allow post-response memory/skill
+                review forks. Disable for callers that prohibit background writes.
         """
         _install_safe_stdio()
 
@@ -1042,6 +1045,7 @@ class AIAgent:
         # would mangle the escape sequences.  None = use builtins.print.
         self._print_fn = None
         self.background_review_callback = None  # Optional sync callback for gateway delivery
+        self.background_review_enabled = background_review_enabled
         self.skip_context_files = skip_context_files
         self.load_soul_identity = load_soul_identity
         self.pass_session_id = pass_session_id
@@ -3612,6 +3616,11 @@ class AIAgent:
         forked conversation. Writes directly to the shared memory/skill stores.
         Never modifies the main conversation history or produces user-visible output.
         """
+        # A caller can prohibit post-response memory/skill mutations without
+        # removing the tools needed to execute the requested task itself.
+        if not getattr(self, "background_review_enabled", True):
+            return
+
         import threading
 
         # Pick the right prompt based on which triggers fired

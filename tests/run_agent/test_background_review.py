@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import run_agent as run_agent_module
 from run_agent import AIAgent
 
@@ -35,6 +37,27 @@ class ImmediateThread:
 
     def start(self):
         self._target()
+
+
+@pytest.mark.parametrize("review_memory,review_skills", [(True, False), (False, True), (True, True)])
+def test_disabled_background_review_does_not_fork_or_start_a_worker(
+    monkeypatch, review_memory, review_skills,
+):
+    agent = _bare_agent()
+    agent.background_review_enabled = False
+
+    def unexpected_worker(*args, **kwargs):
+        pytest.fail("A disabled review must not start a thread or instantiate an agent")
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", unexpected_worker)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", unexpected_worker)
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "Read-only audit"}],
+        review_memory=review_memory,
+        review_skills=review_skills,
+    )
 
 
 def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):

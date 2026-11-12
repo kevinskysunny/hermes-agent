@@ -1225,6 +1225,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
+            # Opt out per job: readonly audits must not fork a mutating review
+            # after their delivered report. Other jobs keep existing behavior.
+            background_review_enabled=job.get("background_review", True) is not False,
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
