@@ -754,12 +754,55 @@ class TestRunJobSessionPersistence:
         assert kwargs["session_db"] is fake_db
         assert kwargs["platform"] == "cron"
         assert kwargs["session_id"].startswith("cron_test-job_")
+        assert kwargs["background_review_enabled"] is False
+        assert kwargs["maintenance_allowed"] is False
         fake_db.end_session.assert_called_once()
         call_args = fake_db.end_session.call_args
         assert call_args[0][0].startswith("cron_test-job_")
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
+
+    def test_iteration_limit_has_specific_error_and_preserves_summary(self, tmp_path):
+        job = {
+            "id": "iteration-limit-job",
+            "name": "iteration limit",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "business delivery succeeded",
+                "completed": False,
+                "failed": False,
+                "api_calls": 90,
+                "turn_exit_reason": "max_iterations_reached(90/90)",
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error.startswith("CronAgentIterationLimitError:")
+        assert "business delivery succeeded" not in error
+        assert "## Agent Summary Before Failure" in output
+        assert "business delivery succeeded" in output
 
     def test_run_job_closes_agent_on_failure_to_prevent_fd_leak(self, tmp_path):
         # Regression: if ``run_conversation`` raises, the ephemeral cron
@@ -1932,6 +1975,22 @@ class TestBuildJobPromptMissingSkill:
             result = _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
         assert "ghost-skill" in result
         assert "not found" in result.lower() or "skipped" in result.lower()
+
+
+class TestBuildJobPromptMaintenanceBoundary:
+    def _missing_skill_view(self, name: str) -> str:
+        return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
+
+    def test_boundary_is_enabled_by_default(self):
+        result = _build_job_prompt({"prompt": "run production sync"})
+        assert "UNATTENDED PRODUCTION BOUNDARY" in result
+        assert "system temporary directory" in result
+
+    def test_boundary_can_be_disabled_explicitly(self):
+        result = _build_job_prompt(
+            {"prompt": "run maintenance", "maintenance_allowed": True}
+        )
+        assert "UNATTENDED PRODUCTION BOUNDARY" not in result
 
     def test_missing_skill_logs_warning(self, caplog):
         """A warning is logged when a skill cannot be found."""

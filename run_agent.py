@@ -970,6 +970,8 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        background_review_enabled: bool = True,
+        maintenance_allowed: bool = True,
     ):
         """
         Initialize the AI Agent.
@@ -1015,6 +1017,10 @@ class AIAgent:
             load_soul_identity (bool): If True, still use ~/.hermes/SOUL.md as the primary
                 identity even when skip_context_files=True. Project context files from the cwd
                 remain skipped.
+            background_review_enabled (bool): Allow post-response memory/skill
+                review forks. Disable for callers that prohibit background writes.
+            maintenance_allowed (bool): Allow mutating maintenance tools. Cron
+                jobs disable this by default and may write temporary files only.
         """
         _install_safe_stdio()
 
@@ -1042,6 +1048,8 @@ class AIAgent:
         # would mangle the escape sequences.  None = use builtins.print.
         self._print_fn = None
         self.background_review_callback = None  # Optional sync callback for gateway delivery
+        self.background_review_enabled = background_review_enabled
+        self.maintenance_allowed = maintenance_allowed
         self.skip_context_files = skip_context_files
         self.load_soul_identity = load_soul_identity
         self.pass_session_id = pass_session_id
@@ -3612,6 +3620,11 @@ class AIAgent:
         forked conversation. Writes directly to the shared memory/skill stores.
         Never modifies the main conversation history or produces user-visible output.
         """
+        # A caller can prohibit post-response memory/skill mutations without
+        # removing the tools needed to execute the requested task itself.
+        if not getattr(self, "background_review_enabled", True):
+            return
+
         import threading
 
         # Pick the right prompt based on which triggers fired
@@ -9428,6 +9441,49 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
+    def _maintenance_policy_block_message(self, tool_name: str, args: dict) -> Optional[str]:
+        """Return a cron maintenance-policy error, or None when allowed."""
+        if self.maintenance_allowed:
+            return None
+
+        if tool_name == "skill_manage":
+            return (
+                "Maintenance is disabled for this unattended job: skill changes "
+                "must be recorded as a follow-up, not applied during the run."
+            )
+
+        if tool_name == "delegate_task":
+            return (
+                "Maintenance is disabled for this unattended job: delegation is "
+                "blocked because a child agent could bypass the job write policy."
+            )
+
+        if tool_name == "memory" and args.get("action") in {"add", "replace"}:
+            return (
+                "Maintenance is disabled for this unattended job: persistent "
+                "memory writes are not allowed."
+            )
+
+        if tool_name not in {"write_file", "patch"}:
+            return None
+
+        raw_path = str(args.get("path") or "").strip()
+        if raw_path:
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                base = Path(os.getenv("TERMINAL_CWD") or os.getcwd())
+                candidate = base / candidate
+            try:
+                candidate.resolve().relative_to(Path(tempfile.gettempdir()).resolve())
+                return None
+            except (OSError, ValueError):
+                pass
+
+        return (
+            "Maintenance is disabled for this unattended job: write_file/patch "
+            "may target only an explicit path under the system temporary directory."
+        )
+
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 
@@ -9480,8 +9536,10 @@ class AIAgent:
         its own inline invocation for backward-compatible display handling.
         """
         # Check plugin hooks for a block directive before executing anything.
-        block_message: Optional[str] = None
-        if not pre_tool_block_checked:
+        block_message: Optional[str] = self._maintenance_policy_block_message(
+            function_name, function_args
+        )
+        if not pre_tool_block_checked and block_message is None:
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 block_message = get_pre_tool_call_block_message(
@@ -9643,13 +9701,15 @@ class AIAgent:
 
             block_result = None
             blocked_by_guardrail = False
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                block_message = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
-                )
-            except Exception:
-                block_message = None
+            block_message = self._maintenance_policy_block_message(function_name, function_args)
+            if block_message is None:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    block_message = get_pre_tool_call_block_message(
+                        function_name, function_args, task_id=effective_task_id or "",
+                    )
+                except Exception:
+                    block_message = None
 
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -9993,14 +10053,17 @@ class AIAgent:
                 function_args = {}
 
             # Check plugin hooks for a block directive before executing.
-            _block_msg: Optional[str] = None
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                _block_msg = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
-                )
-            except Exception:
-                pass
+            _block_msg: Optional[str] = self._maintenance_policy_block_message(
+                function_name, function_args
+            )
+            if _block_msg is None:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    _block_msg = get_pre_tool_call_block_message(
+                        function_name, function_args, task_id=effective_task_id or "",
+                    )
+                except Exception:
+                    pass
 
             _guardrail_block_decision: ToolGuardrailDecision | None = None
             if _block_msg is None:

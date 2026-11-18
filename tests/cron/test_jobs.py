@@ -234,6 +234,21 @@ class TestJobCRUD:
         job = create_job(prompt="Test", schedule="30m")
         assert job["deliver"] == "local"
 
+    def test_unattended_safety_defaults_are_disabled(self, tmp_cron_dir):
+        job = create_job(prompt="Test", schedule="30m")
+        assert job["background_review"] is False
+        assert job["maintenance_allowed"] is False
+
+    def test_unattended_safety_flags_can_be_enabled_explicitly(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Test",
+            schedule="30m",
+            background_review=True,
+            maintenance_allowed=True,
+        )
+        assert job["background_review"] is True
+        assert job["maintenance_allowed"] is True
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):
@@ -250,6 +265,15 @@ class TestUpdateJob:
         # Verify persisted to disk
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
+
+    def test_update_unattended_safety_flags(self, tmp_cron_dir):
+        job = create_job(prompt="Test", schedule="every 1h")
+        updated = update_job(
+            job["id"],
+            {"background_review": True, "maintenance_allowed": True},
+        )
+        assert updated["background_review"] is True
+        assert updated["maintenance_allowed"] is True
 
     def test_update_schedule(self, tmp_cron_dir):
         job = create_job(prompt="Daily report", schedule="every 1h")

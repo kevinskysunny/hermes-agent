@@ -251,6 +251,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    result["background_review"] = job.get("background_review") is True
+    result["maintenance_allowed"] = job.get("maintenance_allowed") is True
     return result
 
 
@@ -274,6 +276,8 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    background_review: Optional[bool] = None,
+    maintenance_allowed: Optional[bool] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -341,6 +345,8 @@ def cronjob(
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
+                background_review=bool(background_review),
+                maintenance_allowed=bool(maintenance_allowed),
             )
             return json.dumps(
                 {
@@ -468,6 +474,10 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if background_review is not None:
+                updates["background_review"] = bool(background_review)
+            if maintenance_allowed is not None:
+                updates["maintenance_allowed"] = bool(maintenance_allowed)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -585,6 +595,16 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content."
                 ),
             },
+            "background_review": {
+                "type": "boolean",
+                "default": False,
+                "description": "Allow post-response memory/skill review. Keep False for unattended production jobs so delivery cannot be followed by background writes.",
+            },
+            "maintenance_allowed": {
+                "type": "boolean",
+                "default": False,
+                "description": "Allow maintenance writes during the agent run. Keep False for production jobs; mutating skill tools and non-temporary file writes are blocked.",
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -655,6 +675,8 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        background_review=args.get("background_review"),
+        maintenance_allowed=args.get("maintenance_allowed"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

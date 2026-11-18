@@ -442,6 +442,8 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    background_review: bool = False,
+    maintenance_allowed: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -486,6 +488,10 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        background_review: Allow post-response memory/skill review. Disabled by
+                default for unattended jobs to prevent writes after delivery.
+        maintenance_allowed: Allow the agent to mutate skills or files outside
+                temporary storage. Disabled by default for unattended jobs.
 
     Returns:
         The created job dict
@@ -572,6 +578,8 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "background_review": bool(background_review),
+        "maintenance_allowed": bool(maintenance_allowed),
     }
 
     jobs = load_jobs()
@@ -613,6 +621,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["workdir"] = None
             else:
                 updates["workdir"] = _normalize_workdir(_wd)
+
+        for flag_name in ("background_review", "maintenance_allowed"):
+            if flag_name in updates:
+                updates[flag_name] = bool(updates[flag_name])
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates

@@ -41,6 +41,18 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+class CronAgentIterationLimitError(RuntimeError):
+    """Agent exhausted its turn budget after producing a final summary."""
+
+    def __init__(self, api_calls: int, max_iterations: int, summary: str = ""):
+        super().__init__(
+            "agent reached the iteration limit "
+            f"({api_calls}/{max_iterations}); a summary was produced, but the "
+            "run did not complete normally"
+        )
+        self.agent_summary = summary.strip()
+
+
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """Resolve the toolset list for a cron job.
 
@@ -798,7 +810,20 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "Never combine [SILENT] with content — either report your "
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
-    prompt = cron_hint + prompt
+    maintenance_hint = ""
+    if job.get("maintenance_allowed") is not True:
+        maintenance_hint = (
+            "[UNATTENDED PRODUCTION BOUNDARY: Execute only the scheduled business "
+            "workflow. Do not create, edit, patch, or delete skills, source code, "
+            "tests, documentation, configuration, cron definitions, or persistent "
+            "helper files. Do not perform background improvement work. Temporary "
+            "artifacts may be written only under the system temporary directory. "
+            "If you find a maintenance opportunity, mention it briefly in the final "
+            "response without implementing it. Once the required business checks, "
+            "delivery, and delivery verification are complete, return the final "
+            "response immediately and stop.]\n\n"
+        )
+    prompt = cron_hint + maintenance_hint + prompt
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
@@ -1225,6 +1250,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
+            # Opt out per job: readonly audits must not fork a mutating review
+            # after their delivered report. Other jobs keep existing behavior.
+            background_review_enabled=job.get("background_review") is True,
+            maintenance_allowed=job.get("maintenance_allowed") is True,
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
@@ -1332,6 +1361,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # job's `last_status` set to "ok". Raise so the except handler below
         # builds the proper failure tuple. (issue #17855)
         if result.get("failed") is True or result.get("completed") is False:
+            _exit_reason = str(result.get("turn_exit_reason") or "")
+            if result.get("completed") is False and _exit_reason.startswith("max_iterations_reached"):
+                raise CronAgentIterationLimitError(
+                    api_calls=int(result.get("api_calls") or max_iterations),
+                    max_iterations=int(max_iterations),
+                    summary=result.get("final_response") or "",
+                )
             _err_text = (
                 result.get("error")
                 or (result.get("final_response") or "").strip()
@@ -1368,6 +1404,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
+
+        agent_summary = getattr(e, "agent_summary", "")
+        summary_section = ""
+        if agent_summary:
+            summary_section = f"""
+## Agent Summary Before Failure
+
+{agent_summary}
+"""
         
         output = f"""# Cron Job: {job_name} (FAILED)
 
@@ -1384,6 +1429,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 ```
 {error_msg}
 ```
+{summary_section}
 """
         return False, output, "", error_msg
 
